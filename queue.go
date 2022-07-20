@@ -10,7 +10,8 @@ type Message struct {
 	Topic    string
 	Payload  Encoder
 	DelayAt  time.Time
-	Metadata interface{}
+	MaxRetry int
+	Metadata any
 }
 
 type Fetcher interface {

@@ -33,7 +33,11 @@ for msg := range fetcher.Messages() {
 ```
 
 #### FEATURE
-Program crashes usually result in lost messages, to avoid this, the library supports safe mode
+Program crashes usually result in lost messages, to avoid this, the library supports retry, When this property is set, the task being processed will be cached.
+Once the cached task exceeds the commitTimeout, it will re-enter the queue
 ```go
-queue := redisq.NewQueue(redisClient, "queue_name", redisq.WithSafeMode(), redisq.WithCommitTimeout(10))
+queue := redisq.NewQueue(redisClient, "queue_name", 
+	redisq.WithMaxRetry(3), // Retry up to 3 times
+	redisq.WithCommitTimeout(10), // When the number of retries is set greater than 0, re-enter the queue and retry if it is not submitted for more than 10 seconds
+)
 ```

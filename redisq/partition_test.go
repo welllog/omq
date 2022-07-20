@@ -2,7 +2,6 @@ package redisq
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
@@ -31,18 +30,20 @@ func TestPartitionPushDelay(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 	msg := omq.Message{
-		ID:      "1",
-		Topic:   "topic",
-		Payload: omq.ByteEncoder("payload"),
-		DelayAt: now.Add(time.Second),
+		ID:       "1",
+		Topic:    "topic",
+		Payload:  omq.ByteEncoder("payload"),
+		DelayAt:  now.Add(time.Second),
+		MaxRetry: 1,
 	}
-	err := p.pushDelay(ctx, &msg, 60)
+	msgID := omq.UUID()
+	err := p.pushDelay(ctx, msgID, &msg, 60)
 
 	if err != nil {
 		t.Fatalf("\t%s Push delay should success: %v", failed, err)
 	}
 
-	score, err := p.rds.ZScore(ctx, "{test_partition:0}:delay", "1").Result()
+	score, err := p.rds.ZScore(ctx, p.delay, msgID).Result()
 	if err != nil {
 		t.Fatalf("\t%s Should get score: %v", failed, err)
 	}
@@ -50,7 +51,7 @@ func TestPartitionPushDelay(t *testing.T) {
 		t.Fatalf("\t%s score = %v, want: %v", failed, score, now.Unix()+1)
 	}
 
-	payload, err := p.rds.Get(ctx, "{test_partition:0}:1").Result()
+	payload, err := p.rds.HGet(ctx, p.prefix+msgID, "msg").Result()
 	if err != nil {
 		t.Fatalf("\t%s Should get payload: %v", failed, err)
 	}
@@ -61,27 +62,71 @@ func TestPartitionPushDelay(t *testing.T) {
 	}
 
 	time.Sleep(time.Second)
-	err = p.delayToReady(ctx, time.Now().Unix())
+	num, err := p.delayToReady(ctx, time.Now().Unix(), 5)
 	if err != nil {
 		t.Fatalf("\t%s Push delay should success: %v", failed, err)
 	}
-
-	remNum, _ := p.rds.ZRem(ctx, "{test_partition:0}:delay", "1").Result()
-	if remNum > 0 {
-		t.Fatalf("\t%s remNum = %v, want: %v", failed, remNum, 0)
+	if num != 1 {
+		t.Fatalf("\t%s to ready task num: %d, want: %d", failed, num, 1)
 	}
 
-	llen, _ := p.rds.LLen(ctx, "{test_partition:0}:ready").Result()
-	if llen != 1 {
-		t.Fatalf("\t%s llen = %v, want: %v", failed, llen, 1)
+	n, err := p.rds.ZCard(ctx, p.delay).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n > 0 {
+		t.Fatalf("\t%s delay queue len = %d, want: %d", failed, n, 0)
 	}
 
-	msgs, err := p.bPopReady(ctx, time.Second)
+	n, err = p.rds.LLen(ctx, p.ready).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("\t%s ready queue len = %v, want: %v", failed, n, 1)
+	}
+
+	fMsg, err := p.fetchReady(ctx)
 	if err != nil {
 		t.Fatalf("\t%s Pop ready should success: %v", failed, err)
 	}
-	if len(msgs) != 1 {
-		t.Fatalf("\t%s ready msg num = %v, want: %v", failed, len(msgs), 1)
+	if fMsg == nil {
+		t.Fatalf("\t%s ready msg num = %v, want: %v", failed, 0, 1)
+	}
+
+	n, err = p.rds.LLen(ctx, p.ready).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("\t%s ready queue len = %v, want: %v", failed, n, 0)
+	}
+
+	n, _ = p.rds.ZCard(ctx, p.unCommit).Result()
+	if n != 1 {
+		t.Fatalf("\t%s uncommit queue len = %v, want: %v", failed, n, 1)
+	}
+
+	err = p.commitAndDelMsg(ctx, msgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err = p.rds.ZCard(ctx, p.unCommit).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if n > 0 {
+		t.Fatalf("\t%s ready queue len = %v, want: %v", failed, n, 0)
+	}
+
+	n, err = p.rds.Exists(ctx, p.prefix+msgID).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if n > 0 {
+		t.Fatalf("\t%s ready queue len = %v, want: %v", failed, n, 0)
 	}
 
 	p.clear(ctx)
@@ -98,23 +143,28 @@ func TestPartitionPushReady(t *testing.T) {
 		Topic:   "topic",
 		Payload: omq.ByteEncoder("payload"),
 	}
-
-	err := p.pushReady(ctx, &msg, 60)
+	msgID := omq.UUID()
+	err := p.pushReady(ctx, msgID, &msg, 60)
 	if err != nil {
 		t.Fatalf("\t%s Push ready should success: %v", failed, err)
 	}
 
-	llen, _ := p.rds.LLen(ctx, "{test_partition:0}:ready").Result()
+	llen, _ := p.rds.LLen(ctx, p.ready).Result()
 	if llen != 1 {
-		t.Fatalf("\t%s llen = %v, want: %v", failed, llen, 1)
+		t.Fatalf("\t%s ready queue len = %v, want: %v", failed, llen, 1)
 	}
 
-	msgs, _ := p.popReady(ctx, 2)
-	if len(msgs) != 1 {
-		t.Fatalf("\t%s ready msg num = %v, want: %v", failed, len(msgs), 1)
+	fMsg, _ := p.fetchReady(ctx)
+	if fMsg == nil {
+		t.Fatalf("\t%s ready msg num = %v, want: %v", failed, 0, 1)
 	}
 
-	err = p.delMsg(ctx, msgs[0].ID)
+	n, _ := p.rds.ZCard(ctx, p.unCommit).Result()
+	if n != 0 {
+		t.Fatalf("\t%s uncommit queue len = %v, want: %v", failed, n, 0)
+	}
+
+	err = p.delMsg(ctx, msgID)
 	if err != nil {
 		t.Fatalf("\t%s del msg: %v", failed, err)
 	}
@@ -122,63 +172,4 @@ func TestPartitionPushReady(t *testing.T) {
 	p.clear(ctx)
 
 	t.Logf("\t%s Push ready success", succeed)
-}
-
-func TestPartitionSafePopReady(t *testing.T) {
-	p := initPartition()
-
-	ctx := context.Background()
-	msg := omq.Message{
-		ID:      "3",
-		Topic:   "topic",
-		Payload: omq.ByteEncoder("payload"),
-	}
-
-	err := p.pushReady(ctx, &msg, 60)
-	if err != nil {
-		t.Fatalf("\t%s Push ready should success: %v", failed, err)
-	}
-
-	msgs, _ := p.safePopReady(ctx, 5)
-	if len(msgs) != 1 {
-		t.Fatalf("\t%s ready msg num = %v, want: %v", failed, len(msgs), 1)
-	}
-	num, _ := p.rds.ZCard(ctx, "{test_partition:0}:unCommit").Result()
-	if num != 1 {
-		t.Fatalf("\t%s unCommit num = %v, want: %v", failed, num, 1)
-	}
-
-	time.Sleep(time.Second)
-	err = p.commitTimeoutToReady(ctx, time.Now().Unix())
-	if err != nil {
-		t.Fatalf("\t%s commit timeout should success: %v", failed, err)
-	}
-
-	readyNum, _ := p.rds.LLen(ctx, "{test_partition:0}:ready").Result()
-	if readyNum != 1 {
-		t.Fatalf("\t%s ready num = %v, want: %v", failed, readyNum, 1)
-	}
-	msgs, _ = p.safePopReady(ctx, 1)
-	if len(msgs) != 1 {
-		t.Fatalf("\t%s ready msg num = %v, want: %v", failed, len(msgs), 1)
-	}
-
-	err = p.commitAndDelMsg(ctx, msgs[0].ID)
-	if err != nil {
-		t.Fatalf("\t%s commitAndDelMsg should success: %v", failed, err)
-	}
-
-	num, _ = p.rds.ZCard(ctx, "{test_partition:0}:unCommit").Result()
-	if num != 0 {
-		t.Fatalf("\t%s unCommit num = %v, want: %v", failed, num, 0)
-	}
-
-	err = p.rds.Get(ctx, "{test_partition:0}:3").Err()
-	if !errors.Is(err, redis.Nil) {
-		t.Fatalf("\t%s msg should be deleted: %v", failed, err)
-	}
-
-	p.clear(ctx)
-
-	t.Logf("\t%s Safe pop ready success", succeed)
 }
