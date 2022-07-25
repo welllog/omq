@@ -151,4 +151,100 @@ func TestWithPartitionOrder(t *testing.T) {
 			m[msg.Topic] = meta.partition
 		}
 	}
+
+	q.Clear(context.TODO())
+}
+
+func TestWithSleepOnEmpty(t *testing.T) {
+	q := NewQueue(_rds, "test:queue", WithPartitionNum(3), WithSleepOnEmpty(time.Second),
+		WithPartitionOrder(), WithMaxRetry(0))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		go func() {
+			for i := 0; i < 10; i++ {
+				q.Produce(ctx, &omq.Message{ // partition 0
+					ID:      "11123",
+					Topic:   "test",
+					Payload: omq.ByteEncoder("hello"),
+				})
+			}
+		}()
+
+		go func() {
+			time.Sleep(60 * time.Millisecond)
+			for i := 0; i < 10; i++ {
+				q.Produce(ctx, &omq.Message{ // partition 1
+					ID:      "2222",
+					Topic:   "test2",
+					Payload: omq.ByteEncoder("hello"),
+				})
+			}
+		}()
+
+		q.Produce(ctx, &omq.Message{ // partition 2
+			ID:      "333",
+			Topic:   "test3",
+			Payload: omq.ByteEncoder("hello"),
+		})
+		time.Sleep(100 * time.Millisecond)
+		q.Produce(ctx, &omq.Message{ // partition 2
+			ID:      "333",
+			Topic:   "test3",
+			Payload: omq.ByteEncoder("hello"),
+		})
+		time.Sleep(time.Second)
+		q.Produce(ctx, &omq.Message{ // partition 2
+			ID:      "333",
+			Topic:   "test3",
+			Payload: omq.ByteEncoder("hello"),
+		})
+
+		time.Sleep(1500 * time.Millisecond)
+		cancel()
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	fetcher, err := q.Fetcher(ctx, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	var i int
+	for msg := range fetcher.Messages() {
+		meta := msg.Metadata.(msgMeta)
+		if msg.Topic == "test" {
+			if time.Since(now).Seconds() >= 1 {
+				t.Log(meta.partition, "---", msg.ID, time.Since(now).Seconds())
+				t.Fatal("sleep must less than 1 second")
+			}
+		} else if msg.Topic == "test2" {
+			if time.Since(now).Seconds() < 1 {
+				t.Log(meta.partition, "---", msg.ID, time.Since(now).Seconds())
+				t.Fatal("sleep must more than 1 second")
+			}
+		} else {
+			if i == 0 {
+				if time.Since(now).Seconds() > 1 {
+					t.Log(meta.partition, "---", msg.ID, time.Since(now).Seconds())
+					t.Fatal("sleep must less than 1 second")
+				}
+			} else if i == 1 {
+				if time.Since(now).Seconds() < 1 {
+					t.Log(meta.partition, "---", msg.ID, time.Since(now).Seconds())
+					t.Fatal("sleep must more than 1 second")
+				}
+			} else {
+				if time.Since(now).Seconds() < 2 {
+					t.Log(meta.partition, "---", msg.ID, time.Since(now).Seconds())
+					t.Fatal("sleep must more than 2 second")
+				}
+			}
+			i++
+		}
+		//t.Log(meta.partition, "---", msg.ID, time.Since(now).Seconds())
+	}
+
+	q.Clear(context.Background())
 }

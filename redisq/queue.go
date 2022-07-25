@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"math"
-	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -190,33 +189,81 @@ func (q *queue) toReady(ctx context.Context) {
 }
 
 func (q *queue) writeMessage(ctx context.Context, ch chan<- *omq.Message) {
-	var w sync.WaitGroup
-
-	for i := range q.partitions {
-		w.Add(1)
-		go func(p *partition) {
-			defer w.Done()
-
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					msg, err := p.fetchReady(ctx)
-					if err == nil {
-						ch <- msg
-					} else if errors.Is(err, errNoMessage) {
-						time.Sleep(q.sleepOnEmpty)
-					} else if !errors.Is(err, context.Canceled) {
-						q.logger.Warnf("popMessage error: %s", err)
-					}
-				}
-			}
-		}(&q.partitions[i])
+	type sleepPtn struct {
+		timer *time.Timer
+		ptn   []int
 	}
 
-	w.Wait()
-	close(ch)
+	workGroup := make([]int, len(q.partitions))
+	sleepGroup := make([]sleepPtn, 0, 10)
+	for i := range q.partitions {
+		workGroup[i] = q.partitions[i].id
+	}
+
+	for {
+		last := len(workGroup) - 1
+		remain := last
+		for i := last; i >= 0; i-- {
+			msg, err := q.partitions[workGroup[i]].fetchReady(ctx)
+			if err == nil {
+				ch <- msg
+			} else if errors.Is(err, errNoMessage) {
+				workGroup[i], workGroup[remain] = workGroup[remain], workGroup[i]
+				remain--
+			} else if errors.Is(err, context.Canceled) {
+				close(ch)
+				return
+			} else {
+				q.logger.Warnf("fetch message error: %s", err)
+			}
+		}
+
+		if last > remain {
+			ptn := make([]int, 0, last-remain)
+			ptn = append(ptn, workGroup[remain+1:]...)
+			sleepGroup = append(sleepGroup, sleepPtn{timer: time.NewTimer(q.sleepOnEmpty), ptn: ptn})
+
+			workGroup = workGroup[:remain+1]
+			if len(workGroup) == 0 {
+				g := sleepGroup[0]
+				select {
+				case <-g.timer.C:
+					workGroup = append(workGroup, g.ptn...)
+					sleepGroup = append(sleepGroup[:0], sleepGroup[1:]...)
+					continue
+				case <-ctx.Done():
+					close(ch)
+					return
+				}
+			}
+		}
+
+		if len(sleepGroup) > 0 {
+			var remove int
+			for _, g := range sleepGroup {
+				select {
+				case <-g.timer.C:
+					workGroup = append(workGroup, g.ptn...)
+					remove++
+				case <-ctx.Done():
+					close(ch)
+					return
+				default:
+					goto end
+				}
+			}
+		end:
+			sleepGroup = append(sleepGroup[:0], sleepGroup[remove:]...)
+		} else {
+			select {
+			case <-ctx.Done():
+				close(ch)
+				return
+			default:
+			}
+		}
+	}
+
 }
 
 func (q *queue) tryLock(ctx context.Context, ttl time.Duration) bool {
