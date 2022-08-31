@@ -17,10 +17,12 @@ func encodeMsg(msg *omq.Message) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	size := 4 + len(msg.ID) + len(msg.Topic) + len(payload)
 	arr := []string{
 		"1", msg.ID, msg.Topic,
 	}
 	var buf strings.Builder
+	buf.Grow(size)
 	for i := range arr {
 		buf.WriteString(arr[i])
 		buf.WriteByte(':')
