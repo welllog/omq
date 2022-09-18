@@ -189,16 +189,13 @@ func (q *queue) toReady(ctx context.Context) {
 }
 
 func (q *queue) writeMessage(ctx context.Context, ch chan<- *omq.Message) {
-	type sleepPtn struct {
-		timer *time.Timer
-		ptn   []int
-	}
-
 	workGroup := make([]int, len(q.partitions))
-	sleepGroup := make([]sleepPtn, 0, 10)
 	for i := range q.partitions {
 		workGroup[i] = q.partitions[i].id
 	}
+
+	sleepGroup := newSleepQueue(len(q.partitions))
+	sleepPool := sleepPtnPool{}
 
 	for {
 		last := len(workGroup) - 1
@@ -219,17 +216,23 @@ func (q *queue) writeMessage(ctx context.Context, ch chan<- *omq.Message) {
 		}
 
 		if last > remain {
-			ptn := make([]int, 0, last-remain)
-			ptn = append(ptn, workGroup[remain+1:]...)
-			sleepGroup = append(sleepGroup, sleepPtn{timer: time.NewTimer(q.sleepOnEmpty), ptn: ptn})
-
+			sleep := sleepPool.Get(last - remain)
+			sleep.ptn = append(sleep.ptn, workGroup[remain+1:]...)
 			workGroup = workGroup[:remain+1]
+
+			if sleep.timer == nil {
+				sleep.timer = time.NewTimer(q.sleepOnEmpty)
+			} else {
+				sleep.timer.Reset(q.sleepOnEmpty)
+			}
+			sleepGroup.Push(sleep)
+
 			if len(workGroup) == 0 {
-				g := sleepGroup[0]
+				g := sleepGroup.Pop()
 				select {
 				case <-g.timer.C:
 					workGroup = append(workGroup, g.ptn...)
-					sleepGroup = append(sleepGroup[:0], sleepGroup[1:]...)
+					sleepPool.Put(g)
 					continue
 				case <-ctx.Done():
 					close(ch)
@@ -238,29 +241,27 @@ func (q *queue) writeMessage(ctx context.Context, ch chan<- *omq.Message) {
 			}
 		}
 
-		if len(sleepGroup) > 0 {
-			var remove int
-			for _, g := range sleepGroup {
-				select {
-				case <-g.timer.C:
-					workGroup = append(workGroup, g.ptn...)
-					remove++
-				case <-ctx.Done():
-					close(ch)
-					return
-				default:
-					goto end
-				}
+		for {
+			g := sleepGroup.Peek()
+			if g == nil {
+				goto end
 			}
-		end:
-			sleepGroup = append(sleepGroup[:0], sleepGroup[remove:]...)
-		} else {
 			select {
-			case <-ctx.Done():
-				close(ch)
-				return
+			case <-g.timer.C:
+				workGroup = append(workGroup, g.ptn...)
+				sleepGroup.Pop()
+				sleepPool.Put(g)
 			default:
+				goto end
 			}
+		}
+
+	end:
+		select {
+		case <-ctx.Done():
+			close(ch)
+			return
+		default:
 		}
 	}
 

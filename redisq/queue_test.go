@@ -10,7 +10,7 @@ import (
 )
 
 func TestQueueProduce(t *testing.T) {
-	q := NewQueue(_rds, "test:queue", WithPartitionNum(2), WithDelMsgOnCommit(), WithMsgTTL(10), WithMaxRetry(0))
+	q := NewQueue(_rds, "test:queue", WithPartitionNum(2), WithDelMsgOnCommit(), WithMsgTTL(20), WithMaxRetry(0))
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -243,7 +243,7 @@ func TestWithSleepOnEmpty(t *testing.T) {
 			}
 			i++
 		}
-		//t.Log(meta.partition, "---", msg.ID, time.Since(now).Seconds())
+		//t.Log(meta.partition, "---", msg.ID, "---", msg.Topic, time.Since(now).Seconds())
 	}
 
 	q.Clear(context.Background())
