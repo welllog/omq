@@ -1,6 +1,6 @@
 package redisq
 
-import "github.com/go-redis/redis/v8"
+import "github.com/redis/go-redis/v9"
 
 var (
 	// KEYS[1] => {<prefix>:<partition>}:ready
@@ -35,6 +35,18 @@ var (
 	// KEYS[3] => {<prefix>:<partition>}:unCommit
 	_sizeCmd = redis.NewScript(
 		`return redis.call('LLEN',KEYS[1])+redis.call('ZCARD',KEYS[2])+redis.call('ZCARD',KEYS[3])`,
+	)
+
+	// KEYS[1] => {<prefix>:<partition>}:delay
+	// KEYS[2] => {<prefix>:<partition>}:unCommit
+	_delaySizeCmd = redis.NewScript(
+		`return redis.call('ZCARD',KEYS[1])+redis.call('ZCARD',KEYS[2])`,
+	)
+
+	// KEYS[1] => {<prefix>:<partition>}:ready
+	// KEYS[2] => {<prefix>:<partition>}:unCommit
+	_readySizeCmd = redis.NewScript(
+		`return redis.call('LLEN',KEYS[1])+redis.call('ZCARD',KEYS[2])`,
 	)
 
 	// KEYS[1] => {<prefix>:<partition>}:delay

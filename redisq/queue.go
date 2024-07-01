@@ -3,30 +3,38 @@ package redisq
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
+
 	"github.com/welllog/omq"
 )
 
 type queue struct {
-	rds            redis.UniversalClient
-	keyPrefix      string
-	disableDelay   bool
-	msgTTL         int64
-	logger         omq.Logger
-	partitionNum   int
-	delMsgOnCommit bool
-	partitionOrder bool
-	sleepOnEmpty   time.Duration
-	commitTimeout  int
-	maxRetry       int
-	partitions     []partition
-	counter        uint32
-	lockKey        string
+	rds                       redis.UniversalClient
+	keyPrefix                 string
+	disableDelay              bool
+	disableReady              bool
+	delMsgOnCommit            bool
+	partitionOrder            bool
+	payloadUniqueOptimization bool
+	msgTTL                    int64
+	logger                    omq.Logger
+	partitionNum              int
+	sleepOnEmpty              time.Duration
+	commitTimeout             int
+	maxRetry                  int
+	partitions                []partition
+	counter                   uint32
+	lockKey                   string
+	encodeFunc                func(*omq.Message) (string, error)
+	decodeFunc                func(string, *omq.Message) error
+	sizeFunc                  func(context.Context, partition) (int, error)
+	pushFunc                  func(context.Context, partition, *omq.Message, string, int64) error
 }
 
 type msgMeta struct {
@@ -41,21 +49,59 @@ func NewQueue(rds redis.UniversalClient, keyPrefix string, opts ...Option) omq.Q
 		opt(&o)
 	}
 
+	var (
+		sizeFunc func(context.Context, partition) (int, error)
+		pushFunc func(context.Context, partition, *omq.Message, string, int64) error
+	)
+	if o.disableDelay { // use ready
+		o.disableReady = false
+		sizeFunc = readySize
+
+		if o.payloadUniqueOptimization {
+			pushFunc = uniquePushReady
+		} else {
+			pushFunc = pushReady
+		}
+	} else if o.disableReady { // use delay
+		o.disableDelay = false
+		sizeFunc = delaySize
+
+		if o.payloadUniqueOptimization {
+			pushFunc = uniquePushDelay
+		} else {
+			pushFunc = pushDelay
+		}
+	} else { // use ready and delay
+		sizeFunc = size
+
+		if o.payloadUniqueOptimization {
+			pushFunc = uniquePush
+		} else {
+			pushFunc = push
+		}
+	}
+
 	q := &queue{
-		rds:            rds,
-		keyPrefix:      keyPrefix,
-		disableDelay:   o.disableDelay,
-		msgTTL:         o.msgTTL,
-		logger:         o.logger,
-		partitionNum:   o.partitionNum,
-		delMsgOnCommit: o.delMsgOnCommit,
-		partitionOrder: o.partitionOrder,
-		sleepOnEmpty:   o.sleepOnEmpty,
-		commitTimeout:  o.commitTimeout,
-		maxRetry:       o.maxRetry,
-		partitions:     make([]partition, o.partitionNum),
-		counter:        0,
-		lockKey:        keyPrefix + ":lock",
+		rds:                       rds,
+		keyPrefix:                 keyPrefix,
+		disableDelay:              o.disableDelay,
+		disableReady:              o.disableReady,
+		delMsgOnCommit:            o.delMsgOnCommit,
+		partitionOrder:            o.partitionOrder,
+		payloadUniqueOptimization: o.payloadUniqueOptimization,
+		msgTTL:                    o.msgTTL,
+		logger:                    o.logger,
+		partitionNum:              o.partitionNum,
+		sleepOnEmpty:              o.sleepOnEmpty,
+		commitTimeout:             o.commitTimeout,
+		maxRetry:                  o.maxRetry,
+		partitions:                make([]partition, o.partitionNum),
+		counter:                   0,
+		lockKey:                   keyPrefix + ":lock",
+		encodeFunc:                o.encodeFunc,
+		decodeFunc:                o.decodeFunc,
+		sizeFunc:                  sizeFunc,
+		pushFunc:                  pushFunc,
 	}
 
 	for i := 0; i < o.partitionNum; i++ {
@@ -67,22 +113,20 @@ func NewQueue(rds redis.UniversalClient, keyPrefix string, opts ...Option) omq.Q
 func (q *queue) Size(ctx context.Context) (int, error) {
 	var totalSize int
 	for i := range q.partitions {
-		size, err := q.partitions[i].size(ctx)
+		n, err := q.sizeFunc(ctx, q.partitions[i])
 		if err != nil {
 			return 0, err
 		}
-		totalSize += size
+		totalSize += n
 	}
 	return totalSize, nil
 }
 
 func (q *queue) Produce(ctx context.Context, msg *omq.Message) error {
-	msgID := omq.UUID()
-
 	var index int
 	if q.partitionNum > 1 {
 		if q.partitionOrder {
-			index = _BKDRHash(_StringToBytes(msg.ID+msg.Topic)) % q.partitionNum
+			index = _BKDRHash(msg.ID) % q.partitionNum
 		} else {
 			count := atomic.AddUint32(&q.counter, 1)
 			index = int(count-1) % q.partitionNum
@@ -92,14 +136,20 @@ func (q *queue) Produce(ctx context.Context, msg *omq.Message) error {
 	if msg.MaxRetry <= 0 {
 		msg.MaxRetry = q.maxRetry
 	}
-	now := time.Now()
-	delay := msg.DelayAt.Unix() - now.Unix()
-	if q.disableDelay || msg.DelayAt.IsZero() || delay <= 0 {
-		msg.DelayAt = now
-		return q.partitions[index].pushReady(ctx, msgID, msg, q.msgTTL)
+
+	rawMsg, err := q.encodeFunc(msg)
+	if err != nil {
+		return fmt.Errorf("encode msg failed: %w", err)
 	}
 
-	return q.partitions[index].pushDelay(ctx, msgID, msg, delay+q.msgTTL)
+	ttl := q.msgTTL
+	if q.disableReady {
+		delay := time.Until(msg.DelayAt)
+		if delay > 0 {
+			ttl += int64(delay.Seconds())
+		}
+	}
+	return q.pushFunc(ctx, q.partitions[index], msg, rawMsg, ttl)
 }
 
 func (q *queue) Clear(ctx context.Context) error {
@@ -306,11 +356,11 @@ func _StringToBytes(s string) []byte {
 	))
 }
 
-func _BKDRHash(str []byte) int {
+func _BKDRHash(s string) int {
 	var seed uint64 = 131 // 31 131 1313 13131 131313 etc..
 	var hash uint64 = 0
-	for i := 0; i < len(str); i++ {
-		hash = hash*seed + uint64(str[i])
+	for i := 0; i < len(s); i++ {
+		hash = hash*seed + uint64(s[i])
 	}
-	return int(hash & uint64(math.MaxInt)) // 0x7FFFFFFFFFFFFFFF = 2^63 - 1
+	return int(hash & math.MaxInt) // 0x7FFFFFFFFFFFFFFF = 2^63 - 1
 }
