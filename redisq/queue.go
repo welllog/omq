@@ -35,12 +35,14 @@ type queue struct {
 	sizeFunc                  func(context.Context, partition) (int, error)
 	pushFunc                  func(context.Context, partition, *omq.Message, string, int64) error
 	commitTimeoutFunc         func(context.Context, partition, int64, int64) (int, error)
+	fetchFunc                 func(context.Context, partition, func(string, *omq.Message) error) (*omq.Message, error)
 }
 
 type msgMeta struct {
 	partition int
 	msgId     string
 	retry     int
+	rawMsg    string
 }
 
 func NewQueue(rds redis.UniversalClient, keyPrefix string, opts ...Option) omq.Queue {
@@ -53,6 +55,7 @@ func NewQueue(rds redis.UniversalClient, keyPrefix string, opts ...Option) omq.Q
 		sizeFunc          func(context.Context, partition) (int, error)
 		pushFunc          func(context.Context, partition, *omq.Message, string, int64) error
 		commitTimeoutFunc func(context.Context, partition, int64, int64) (int, error)
+		fetchFunc         func(context.Context, partition, func(string, *omq.Message) error) (*omq.Message, error)
 	)
 	if o.disableDelay { // use ready
 		o.disableReady = false
@@ -61,9 +64,11 @@ func NewQueue(rds redis.UniversalClient, keyPrefix string, opts ...Option) omq.Q
 		if o.payloadUniqueOptimization {
 			pushFunc = uniquePushReady
 			commitTimeoutFunc = uniqueCommitTimeoutToReady
+			fetchFunc = uniqueFetchReadyMessage
 		} else {
 			pushFunc = pushReady
 			commitTimeoutFunc = commitTimeoutToReady
+			fetchFunc = fetchReadyMessage
 		}
 	} else if o.disableReady { // use delay
 		o.disableDelay = false
@@ -72,9 +77,11 @@ func NewQueue(rds redis.UniversalClient, keyPrefix string, opts ...Option) omq.Q
 		if o.payloadUniqueOptimization {
 			pushFunc = uniquePushDelay
 			commitTimeoutFunc = uniqueCommitTimeoutToDelay
+			fetchFunc = uniqueFetchDelayMessage
 		} else {
 			pushFunc = pushDelay
 			commitTimeoutFunc = commitTimeoutToDelay
+			fetchFunc = fetchDelayMessage
 		}
 	} else { // use ready and delay
 		sizeFunc = size
@@ -82,9 +89,11 @@ func NewQueue(rds redis.UniversalClient, keyPrefix string, opts ...Option) omq.Q
 		if o.payloadUniqueOptimization {
 			pushFunc = uniquePush
 			commitTimeoutFunc = uniqueCommitTimeoutToReady
+			fetchFunc = uniqueFetchReadyMessage
 		} else {
 			pushFunc = push
 			commitTimeoutFunc = commitTimeoutToReady
+			fetchFunc = fetchReadyMessage
 		}
 	}
 
@@ -110,6 +119,7 @@ func NewQueue(rds redis.UniversalClient, keyPrefix string, opts ...Option) omq.Q
 		sizeFunc:                  sizeFunc,
 		pushFunc:                  pushFunc,
 		commitTimeoutFunc:         commitTimeoutFunc,
+		fetchFunc:                 fetchFunc,
 	}
 
 	for i := 0; i < o.partitionNum; i++ {
@@ -152,9 +162,12 @@ func (q *queue) Produce(ctx context.Context, msg *omq.Message) error {
 
 	ttl := q.msgTTL
 	if q.disableReady {
-		delay := time.Until(msg.DelayAt)
+		now := time.Now()
+		delay := msg.DelayAt.Sub(now)
 		if delay > 0 {
 			ttl += int64(delay.Seconds())
+		} else {
+			msg.DelayAt = now
 		}
 	}
 	return q.pushFunc(ctx, q.partitions[index], msg, rawMsg, ttl)
@@ -237,7 +250,7 @@ func (q *queue) fetchMessage(ctx context.Context, ch chan<- *omq.Message) {
 	for {
 		remain := len(workGroup) - 1
 		for i := remain; i >= 0; i-- {
-			msg, err := q.partitions[workGroup[i]].fetchReady(ctx)
+			msg, err := q.fetchFunc(ctx, q.partitions[workGroup[i]], q.decodeFunc)
 			if err == nil {
 				ch <- msg
 			} else if errors.Is(err, errNoMessage) {
@@ -355,21 +368,32 @@ func (q *queue) tryLock(ctx context.Context, ttl time.Duration) bool {
 
 func (q *queue) commitMsg(ctx context.Context, msg *omq.Message) error {
 	meta, ok := msg.Metadata.(msgMeta)
-	if ok && meta.retry > 0 {
-		return q.partitions[meta.partition].commitMsg(ctx, meta.msgId)
+	if !ok {
+		return errMetadata
 	}
-	return nil
+
+	if meta.retry <= 0 {
+		return nil
+	}
+
+	if q.payloadUniqueOptimization {
+		return uniqueCommitMsg(ctx, q.partitions[meta.partition], meta)
+	}
+
+	return commitMsg(ctx, q.partitions[meta.partition], meta)
 }
 
 func (q *queue) commitAndDelMsg(ctx context.Context, msg *omq.Message) error {
 	meta, ok := msg.Metadata.(msgMeta)
-	if ok {
-		if meta.retry > 0 {
-			return q.partitions[meta.partition].commitAndDelMsg(ctx, meta.msgId)
-		}
-		return q.partitions[meta.partition].delMsg(ctx, meta.msgId)
+	if !ok {
+		return errMetadata
 	}
-	return nil
+
+	if q.payloadUniqueOptimization {
+		return uniqueCommitMsg(ctx, q.partitions[meta.partition], meta)
+	}
+
+	return commitAndDelMsg(ctx, q.partitions[meta.partition], meta)
 }
 
 func (q *queue) initFetcher(bufferSize int) *fetcher {

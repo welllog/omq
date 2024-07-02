@@ -6,8 +6,130 @@ import (
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"github.com/welllog/omq"
 )
+
+var _rds redis.UniversalClient
+
+func TestMain(m *testing.M) {
+	_rds = redis.NewUniversalClient(&redis.UniversalOptions{})
+	m.Run()
+	_ = _rds.Close()
+}
+
+func TestQueue_Produce(t *testing.T) {
+	//q1 := NewQueue(_rds, "queue")
+	//q2 := NewQueue(_rds, "queue-unique", WithPayloadUniqueOptimization())
+	//q3 := NewQueue(_rds, "queue-delay", WithDisableReady())
+	//q4 := NewQueue(_rds, "queue-ready", WithDisableDelay())
+	//q5 := NewQueue(_rds, "queue-delay-unique", WithPayloadUniqueOptimization(), WithDisableReady())
+	q6 := NewQueue(_rds, "queue-ready-unique", WithPayloadUniqueOptimization(), WithDisableDelay())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	now := time.Now()
+
+	//Nil(t, q1.Produce(ctx, &omq.Message{Payload: omq.ByteEncoder("words-queue-1")}))
+	//Nil(t, q1.Produce(ctx, &omq.Message{Payload: omq.ByteEncoder("words-queue-2"), DelayAt: now.Add(10 * time.Second)}))
+	//fmt.Println(q1.Size(ctx))
+	//fetcher, err := q1.Fetcher(ctx, 2)
+	//if err != nil {
+	//	t.Fatalf("\t%s fetcher get: %v", failed, err)
+	//}
+	//
+	//go func() {
+	//	time.Sleep(11 * time.Second)
+	//	cancel()
+	//}()
+	//for msg := range fetcher.Messages() {
+	//	Nil(t, fetcher.Commit(ctx, msg))
+	//	fmt.Printf("%+v \n", msg)
+	//}
+	//q1.Clear(context.Background())
+
+	//Nil(t, q2.Produce(ctx, &omq.Message{Payload: omq.ByteEncoder("words-queue-unique-1")}))
+	//Nil(t, q2.Produce(ctx, &omq.Message{Payload: omq.ByteEncoder("words-queue-unique-2"), DelayAt: now.Add(10 * time.Second)}))
+	//fetcher, err := q2.Fetcher(ctx, 2)
+	//if err != nil {
+	//	t.Fatalf("\t%s fetcher get: %v", failed, err)
+	//}
+	//
+	//go func() {
+	//	time.Sleep(11 * time.Second)
+	//	cancel()
+	//}()
+	//for msg := range fetcher.Messages() {
+	//	Nil(t, fetcher.Commit(ctx, msg))
+	//	fmt.Printf("%+v \n", msg)
+	//}
+
+	//Nil(t, q3.Produce(ctx, &omq.Message{Payload: omq.ByteEncoder("words-queue-delay-1")}))
+	//Nil(t, q3.Produce(ctx, &omq.Message{Payload: omq.ByteEncoder("words-queue-delay-2"), DelayAt: now.Add(10 * time.Second)}))
+	//fetcher, err := q3.Fetcher(ctx, 2)
+	//if err != nil {
+	//	t.Fatalf("\t%s fetcher get: %v", failed, err)
+	//}
+	//
+	//go func() {
+	//	time.Sleep(11 * time.Second)
+	//	cancel()
+	//}()
+	//for msg := range fetcher.Messages() {
+	//	Nil(t, fetcher.Commit(ctx, msg))
+	//	fmt.Printf("%+v \n", msg)
+	//}
+
+	//Nil(t, q4.Produce(ctx, &omq.Message{Payload: omq.ByteEncoder("words-queue-ready-1")}))
+	//Nil(t, q4.Produce(ctx, &omq.Message{Payload: omq.ByteEncoder("words-queue-ready-1"), DelayAt: now.Add(10 * time.Second)}))
+	//fetcher, err := q4.Fetcher(ctx, 2)
+	//if err != nil {
+	//	t.Fatalf("\t%s fetcher get: %v", failed, err)
+	//}
+	//
+	//go func() {
+	//	time.Sleep(11 * time.Second)
+	//	cancel()
+	//}()
+	//for msg := range fetcher.Messages() {
+	//	Nil(t, fetcher.Commit(ctx, msg))
+	//	fmt.Printf("%+v \n", msg)
+	//}
+
+	//Nil(t, q5.Produce(ctx, &omq.Message{Payload: omq.ByteEncoder("words-queue-unique-delay-1")}))
+	//Nil(t, q5.Produce(ctx, &omq.Message{Payload: omq.ByteEncoder("words-queue-unique-delay-2"), DelayAt: now.Add(10 * time.Second)}))
+	//fetcher, err := q5.Fetcher(ctx, 2)
+	//if err != nil {
+	//	t.Fatalf("\t%s fetcher get: %v", failed, err)
+	//}
+	//
+	//go func() {
+	//	time.Sleep(11 * time.Second)
+	//	cancel()
+	//}()
+	//for msg := range fetcher.Messages() {
+	//	Nil(t, fetcher.Commit(ctx, msg))
+	//	fmt.Printf("%+v \n", msg)
+	//}
+
+	Nil(t, q6.Produce(ctx, &omq.Message{Payload: omq.ByteEncoder("words-queue-unique-ready-1")}))
+	Nil(t, q6.Produce(ctx, &omq.Message{Payload: omq.ByteEncoder("words-queue-unique-ready-2"), DelayAt: now.Add(10 * time.Second)}))
+	fetcher, err := q6.Fetcher(ctx, 2)
+	if err != nil {
+		t.Fatalf("\t%s fetcher get: %v", failed, err)
+	}
+
+	go func() {
+		time.Sleep(22 * time.Second)
+		cancel()
+	}()
+	for msg := range fetcher.Messages() {
+		Nil(t, fetcher.Commit(ctx, msg))
+		fmt.Printf("%+v \n", msg)
+	}
+}
 
 func TestQueueProduce(t *testing.T) {
 	q := NewQueue(_rds, "test:queue", WithPartitionNum(2), WithDelMsgOnCommit(), WithMsgTTL(20), WithMaxRetry(0))
@@ -81,24 +203,24 @@ func TestQueueCommitTimeOut(t *testing.T) {
 		MaxRetry: 3,
 	})
 
+	now := time.Now()
 	fetcher, err := q.Fetcher(ctx, 2)
 	if err != nil {
 		t.Fatalf("\t%s fetcher get: %v", failed, err)
 	}
 
 	go func() {
-		time.Sleep(1500 * time.Millisecond)
+		time.Sleep(10 * time.Second)
 		cancel()
 	}()
 
-	now := time.Now()
 	var i int
 	for msg := range fetcher.Messages() {
 		now1 := time.Now()
 		fmt.Println(now1.Sub(now).Milliseconds())
 		now = now1
-		fmt.Println(msg)
-		if i > 0 {
+		fmt.Printf("%+v \n", msg)
+		if i > 5 {
 			fetcher.Commit(ctx, msg)
 		}
 		i++
@@ -247,4 +369,11 @@ func TestWithSleepOnEmpty(t *testing.T) {
 	}
 
 	q.Clear(context.Background())
+}
+
+func Nil(t *testing.T, err error) {
+	if err != nil {
+		t.Helper()
+		t.Fatalf("unexpected error: %v", err)
+	}
 }

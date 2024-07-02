@@ -3,6 +3,7 @@ package redisq
 import (
 	"context"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -53,10 +54,12 @@ func pushDelay(ctx context.Context, p partition, msg *omq.Message, rawMsg string
 }
 
 func uniquePushReady(ctx context.Context, p partition, msg *omq.Message, rawMsg string, ttl int64) error {
+	rawMsg = "@" + strconv.Itoa(msg.MaxRetry) + "#" + rawMsg
 	return p.rds.RPush(ctx, p.ready, rawMsg).Err()
 }
 
 func uniquePushDelay(ctx context.Context, p partition, msg *omq.Message, rawMsg string, ttl int64) error {
+	rawMsg = "@" + strconv.Itoa(msg.MaxRetry) + "#" + rawMsg
 	return p.rds.ZAdd(ctx, p.delay, redis.Z{Score: float64(msg.DelayAt.Unix()), Member: rawMsg}).Err()
 }
 
@@ -82,24 +85,123 @@ func uniqueCommitTimeoutToDelay(ctx context.Context, p partition, timeoutAt, num
 	return _uniqueUnCommitToDelayCmd.Run(ctx, p.rds, []string{p.unCommit, p.delay}, timeoutAt, num, retryAt).Int()
 }
 
-func fetchReadyMessage(ctx context.Context, p partition, decodeFunc func(*omq.Message) (string, error)) (*omq.Message, error) {
+func fetchReadyMessage(ctx context.Context, p partition, decodeFunc func(string, *omq.Message) error) (*omq.Message, error) {
 	arr, err := _fetchReadyCmd.Run(ctx, p.rds, []string{p.ready, p.unCommit}, p.prefix, time.Now().Unix()).StringSlice()
 	if err != nil {
-		return "", "", 0, err
+		return nil, err
 	}
 
 	if len(arr) != 3 {
-		return "", "", 0, errNoMessage
+		return nil, errNoMessage
 	}
 
-	retry, _ = strconv.Atoi(arr[2])
-	return arr[0], arr[1], retry, nil
+	var msg omq.Message
+	err = decodeFunc(arr[1], &msg)
+	if err != nil {
+		return nil, err
+	}
+
+	retry, _ := strconv.Atoi(arr[2])
+	msg.Metadata = msgMeta{
+		partition: p.id,
+		msgId:     arr[0],
+		retry:     retry,
+	}
+
+	return &msg, nil
 }
 
-func uniqueFetchReadyMessage(ctx context.Context, p partition) (msgId, rawMsg string, retry int, err error) {
-	rawMsg, err = p.rds.LPop(ctx, p.ready).Result()
+func uniqueFetchReadyMessage(ctx context.Context, p partition, decodeFunc func(string, *omq.Message) error) (*omq.Message, error) {
+	arr, err := _uniqueFetchReadyCmd.Run(ctx, p.rds, []string{p.ready, p.unCommit}, time.Now().Unix()).StringSlice()
 	if err != nil {
-		return "", "", 0, err
+		return nil, err
 	}
-	return "", rawMsg, 0, nil
+
+	if len(arr) != 2 {
+		return nil, errNoMessage
+	}
+
+	index := strings.Index(arr[0], "#")
+	var msg omq.Message
+	err = decodeFunc(arr[0][index+1:], &msg)
+	if err != nil {
+		return nil, err
+	}
+
+	retry, _ := strconv.Atoi(arr[1])
+	msg.Metadata = msgMeta{
+		partition: p.id,
+		retry:     retry,
+		rawMsg:    arr[0][index+1:],
+	}
+	return &msg, nil
+}
+
+func fetchDelayMessage(ctx context.Context, p partition, decodeFunc func(string, *omq.Message) error) (*omq.Message, error) {
+	arr, err := _fetchDelayCmd.Run(ctx, p.rds, []string{p.delay, p.unCommit}, p.prefix, time.Now().Unix()).StringSlice()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(arr) != 3 {
+		return nil, errNoMessage
+	}
+
+	var msg omq.Message
+	err = decodeFunc(arr[1], &msg)
+	if err != nil {
+		return nil, err
+	}
+
+	retry, _ := strconv.Atoi(arr[2])
+	msg.Metadata = msgMeta{
+		partition: p.id,
+		msgId:     arr[0],
+		retry:     retry,
+	}
+
+	return &msg, nil
+}
+
+func uniqueFetchDelayMessage(ctx context.Context, p partition, decodeFunc func(string, *omq.Message) error) (*omq.Message, error) {
+	arr, err := _uniqueFetchDelayCmd.Run(ctx, p.rds, []string{p.delay, p.unCommit}, time.Now().Unix()).StringSlice()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(arr) != 2 {
+		return nil, errNoMessage
+	}
+
+	index := strings.Index(arr[0], "#")
+	var msg omq.Message
+	err = decodeFunc(arr[0][index+1:], &msg)
+	if err != nil {
+		return nil, err
+	}
+
+	retry, _ := strconv.Atoi(arr[1])
+	msg.Metadata = msgMeta{
+		partition: p.id,
+		retry:     retry,
+		rawMsg:    arr[0][index+1:],
+	}
+	return &msg, nil
+}
+
+func commitMsg(ctx context.Context, p partition, meta msgMeta) error {
+	return p.rds.ZRem(ctx, p.unCommit, meta.msgId).Err()
+}
+
+func uniqueCommitMsg(ctx context.Context, p partition, meta msgMeta) error {
+	rawMsg := "@" + strconv.Itoa(meta.retry-1) + "#" + meta.rawMsg
+	return p.rds.ZRem(ctx, p.unCommit, rawMsg).Err()
+}
+
+func commitAndDelMsg(ctx context.Context, p partition, meta msgMeta) error {
+	if meta.retry > 0 {
+		return _removeMsgCmd.Run(ctx, p.rds, []string{p.unCommit, p.prefix + meta.msgId}, meta.msgId).Err()
+	}
+
+	return p.rds.Del(ctx, p.prefix+meta.msgId).Err()
 }
