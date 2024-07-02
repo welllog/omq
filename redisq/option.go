@@ -37,7 +37,7 @@ type options struct {
 	sleepOnEmpty time.Duration
 
 	// How long does it take for a message to rejoin the queue when it has not been submitted in safe mode, in seconds
-	commitTimeout int
+	commitTimeout int64
 
 	// Max retry times when commit timeout
 	maxRetry int
@@ -130,7 +130,7 @@ func WithSleepOnEmpty(sleep time.Duration) Option {
 	}
 }
 
-func WithCommitTimeout(timeout int) Option {
+func WithCommitTimeout(timeout int64) Option {
 	return func(o *options) {
 		if timeout > 0 {
 			o.commitTimeout = timeout

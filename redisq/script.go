@@ -92,4 +92,38 @@ var (
 			`for k,v in ipairs(a) do if redis.call('EXISTS',ARGV[3]..v)==1 then table.insert(b,v) end end;` +
 			`if next(b)~=nil then redis.call('RPUSH',KEYS[2],unpack(b)) end end;return #b`,
 	)
+
+	// KEYS[1] => {<prefix>:<partition>}:unCommit
+	// KEYS[2] => {<prefix>:<partition>}:delay
+	// ARGV[1] => timestamp of timeout
+	// ARGV[2] => task num
+	// ARGV[3] => {<prefix>:<partition>}:
+	// ARGV[4] => timestamp of enqueue
+	_unCommitToDelayCmd = redis.NewScript(
+		`local a=redis.call('ZRANGEBYSCORE',KEYS[1],'-inf',ARGV[1],'limit',0,ARGV[2]);local n=0;` +
+			`if next(a)~=nil then redis.call('ZREMRANGEBYRANK',KEYS[1],0,#a-1);` +
+			`for k,v in ipairs(a) do if redis.call('EXISTS',ARGV[3]..v)==1 then ` +
+			`n=n+redis.call('ZADD',KEYS[2],ARGV[4],v) end end end;return n`,
+	)
+
+	// KEYS[1] => {<prefix>:<partition>}:unCommit
+	// KEYS[2] => {<prefix>:<partition>}:ready
+	// ARGV[1] => timestamp of timeout
+	// ARGV[2] => task num
+	_uniqueUnCommitToReadyCmd = redis.NewScript(
+		`local a=redis.call('ZRANGEBYSCORE',KEYS[1],'-inf',ARGV[1],'limit',0,ARGV[2]);` +
+			`if next(a)~=nil then redis.call('ZREMRANGEBYRANK',KEYS[1],0,#a-1);` +
+			`return redis.call('RPUSH',KEYS[2],unpack(a)) end;return 0`,
+	)
+
+	// KEYS[1] => {<prefix>:<partition>}:unCommit
+	// KEYS[2] => {<prefix>:<partition>}:delay
+	// ARGV[1] => timestamp of timeout
+	// ARGV[2] => task num
+	// ARGV[3] => timestamp of enqueue
+	_uniqueUnCommitToDelayCmd = redis.NewScript(
+		`local a=redis.call('ZRANGEBYSCORE',KEYS[1],'-inf',ARGV[1],'limit',0,ARGV[2]);local n=0;` +
+			`if next(a)~=nil then redis.call('ZREMRANGEBYRANK',KEYS[1],0,#a-1);` +
+			`for k,v in ipairs(a) do n=n+redis.call('ZADD',KEYS[2],ARGV[3],v) end end;return n`,
+	)
 )

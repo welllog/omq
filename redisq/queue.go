@@ -7,7 +7,6 @@ import (
 	"math"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/redis/go-redis/v9"
 
@@ -26,7 +25,7 @@ type queue struct {
 	logger                    omq.Logger
 	partitionNum              int
 	sleepOnEmpty              time.Duration
-	commitTimeout             int
+	commitTimeout             int64
 	maxRetry                  int
 	partitions                []partition
 	counter                   uint32
@@ -35,6 +34,7 @@ type queue struct {
 	decodeFunc                func(string, *omq.Message) error
 	sizeFunc                  func(context.Context, partition) (int, error)
 	pushFunc                  func(context.Context, partition, *omq.Message, string, int64) error
+	commitTimeoutFunc         func(context.Context, partition, int64, int64) (int, error)
 }
 
 type msgMeta struct {
@@ -50,8 +50,9 @@ func NewQueue(rds redis.UniversalClient, keyPrefix string, opts ...Option) omq.Q
 	}
 
 	var (
-		sizeFunc func(context.Context, partition) (int, error)
-		pushFunc func(context.Context, partition, *omq.Message, string, int64) error
+		sizeFunc          func(context.Context, partition) (int, error)
+		pushFunc          func(context.Context, partition, *omq.Message, string, int64) error
+		commitTimeoutFunc func(context.Context, partition, int64, int64) (int, error)
 	)
 	if o.disableDelay { // use ready
 		o.disableReady = false
@@ -59,8 +60,10 @@ func NewQueue(rds redis.UniversalClient, keyPrefix string, opts ...Option) omq.Q
 
 		if o.payloadUniqueOptimization {
 			pushFunc = uniquePushReady
+			commitTimeoutFunc = uniqueCommitTimeoutToReady
 		} else {
 			pushFunc = pushReady
+			commitTimeoutFunc = commitTimeoutToReady
 		}
 	} else if o.disableReady { // use delay
 		o.disableDelay = false
@@ -68,16 +71,20 @@ func NewQueue(rds redis.UniversalClient, keyPrefix string, opts ...Option) omq.Q
 
 		if o.payloadUniqueOptimization {
 			pushFunc = uniquePushDelay
+			commitTimeoutFunc = uniqueCommitTimeoutToDelay
 		} else {
 			pushFunc = pushDelay
+			commitTimeoutFunc = commitTimeoutToDelay
 		}
 	} else { // use ready and delay
 		sizeFunc = size
 
 		if o.payloadUniqueOptimization {
 			pushFunc = uniquePush
+			commitTimeoutFunc = uniqueCommitTimeoutToReady
 		} else {
 			pushFunc = push
+			commitTimeoutFunc = commitTimeoutToReady
 		}
 	}
 
@@ -102,6 +109,7 @@ func NewQueue(rds redis.UniversalClient, keyPrefix string, opts ...Option) omq.Q
 		decodeFunc:                o.decodeFunc,
 		sizeFunc:                  sizeFunc,
 		pushFunc:                  pushFunc,
+		commitTimeoutFunc:         commitTimeoutFunc,
 	}
 
 	for i := 0; i < o.partitionNum; i++ {
@@ -154,7 +162,7 @@ func (q *queue) Produce(ctx context.Context, msg *omq.Message) error {
 
 func (q *queue) Clear(ctx context.Context) error {
 	for i := range q.partitions {
-		if err := q.partitions[i].clear(ctx); err != nil {
+		if err := clean(ctx, q.partitions[i]); err != nil {
 			return err
 		}
 	}
@@ -165,23 +173,23 @@ func (q *queue) Fetcher(ctx context.Context, bufferSize int) (omq.Fetcher, error
 	f := q.initFetcher(bufferSize)
 
 	go func() {
-		q.toReady(ctx)
+		q.mutexLoop(ctx)
 	}()
 
 	go func() {
-		q.writeMessage(ctx, f.ch)
+		q.fetchMessage(ctx, f.ch)
 	}()
+
 	return f, nil
 }
 
-func (q *queue) toReady(ctx context.Context) {
+func (q *queue) mutexLoop(ctx context.Context) {
 	var (
-		locked        bool
-		lockInterval  time.Duration
-		unix          int64
-		lockTtl       = time.Duration(5)
-		commitTimeout = q.commitTimeout
-		taskNum       = 6
+		locked       bool
+		lockInterval time.Duration
+		unix         int64
+		lockTtl      = time.Duration(6)
+		batchSize    = int64(6)
 	)
 
 	ticker := time.NewTicker(time.Second)
@@ -199,33 +207,11 @@ func (q *queue) toReady(ctx context.Context) {
 			}
 
 			if locked {
-				if !q.disableDelay {
-					for i := range q.partitions {
-						for {
-							num, err := q.partitions[i].delayToReady(ctx, unix, taskNum)
-							if num == taskNum {
-								continue
-							}
-							if err != nil && !errors.Is(err, context.Canceled) {
-								q.logger.Warnf("delayToReady error: %s", err)
-							}
-							break
-						}
-					}
+				if !q.disableReady && !q.disableDelay {
+					q.delayToReadyTask(ctx, unix, batchSize)
 				}
 
-				for i := range q.partitions {
-					for {
-						num, err := q.partitions[i].commitTimeoutToReady(ctx, unix-int64(commitTimeout), taskNum)
-						if num == taskNum {
-							continue
-						}
-						if err != nil && !errors.Is(err, context.Canceled) {
-							q.logger.Warnf("commitTimeoutToReady error: %s", err)
-						}
-						break
-					}
-				}
+				q.commitTimeoutTask(ctx, unix, batchSize)
 			}
 
 			lockInterval++
@@ -238,19 +224,19 @@ func (q *queue) toReady(ctx context.Context) {
 	}
 }
 
-func (q *queue) writeMessage(ctx context.Context, ch chan<- *omq.Message) {
+func (q *queue) fetchMessage(ctx context.Context, ch chan<- *omq.Message) {
 	workGroup := make([]int, len(q.partitions))
 	for i := range q.partitions {
 		workGroup[i] = q.partitions[i].id
 	}
 
-	sleepGroup := newSleepQueue(len(q.partitions))
+	sleepGroup := &sleepQueue{}
+	sleepGroup.init(len(q.partitions))
 	sleepPool := sleepPtnPool{}
 
 	for {
-		last := len(workGroup) - 1
-		remain := last
-		for i := last; i >= 0; i-- {
+		remain := len(workGroup) - 1
+		for i := remain; i >= 0; i-- {
 			msg, err := q.partitions[workGroup[i]].fetchReady(ctx)
 			if err == nil {
 				ch <- msg
@@ -265,10 +251,10 @@ func (q *queue) writeMessage(ctx context.Context, ch chan<- *omq.Message) {
 			}
 		}
 
-		if last > remain {
-			sleep := sleepPool.Get(last - remain)
-			sleep.ptn = append(sleep.ptn, workGroup[remain+1:]...)
-			workGroup = workGroup[:remain+1]
+		workGroupDrop := workGroup[remain+1:]
+		workGroup = workGroup[:remain+1]
+		if len(workGroupDrop) > 0 {
+			sleep := sleepPool.GetBy(workGroupDrop)
 
 			if sleep.timer == nil {
 				sleep.timer = time.NewTimer(q.sleepOnEmpty)
@@ -291,22 +277,24 @@ func (q *queue) writeMessage(ctx context.Context, ch chan<- *omq.Message) {
 			}
 		}
 
+	wait:
 		for {
 			g := sleepGroup.Peek()
 			if g == nil {
-				goto end
+				break
 			}
+
 			select {
 			case <-g.timer.C:
 				workGroup = append(workGroup, g.ptn...)
 				sleepGroup.Pop()
 				sleepPool.Put(g)
+
 			default:
-				goto end
+				break wait
 			}
 		}
 
-	end:
 		select {
 		case <-ctx.Done():
 			close(ch)
@@ -315,6 +303,50 @@ func (q *queue) writeMessage(ctx context.Context, ch chan<- *omq.Message) {
 		}
 	}
 
+}
+
+func (q *queue) delayToReadyTask(ctx context.Context, now, batchSize int64) {
+stop:
+	for i := range q.partitions {
+		for {
+			num, err := delayToReady(ctx, q.partitions[i], now, batchSize)
+			if int64(num) == batchSize {
+				continue
+			}
+
+			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					break stop
+				}
+
+				q.logger.Warnf("delayToReady error: %s", err)
+			}
+
+			break
+		}
+	}
+}
+
+func (q *queue) commitTimeoutTask(ctx context.Context, now, batchSize int64) {
+stop:
+	for i := range q.partitions {
+		for {
+			num, err := q.commitTimeoutFunc(ctx, q.partitions[i], now-q.commitTimeout, batchSize)
+			if int64(num) == batchSize {
+				continue
+			}
+
+			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					break stop
+				}
+
+				q.logger.Warnf("commitTimeoutToReady error: %s", err)
+			}
+
+			break
+		}
+	}
 }
 
 func (q *queue) tryLock(ctx context.Context, ttl time.Duration) bool {
@@ -345,15 +377,6 @@ func (q *queue) initFetcher(bufferSize int) *fetcher {
 		return newFetcher(bufferSize, q.commitAndDelMsg)
 	}
 	return newFetcher(bufferSize, q.commitMsg)
-}
-
-func _StringToBytes(s string) []byte {
-	return *(*[]byte)(unsafe.Pointer(
-		&struct {
-			string
-			Cap int
-		}{s, len(s)},
-	))
 }
 
 func _BKDRHash(s string) int {

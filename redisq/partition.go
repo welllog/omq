@@ -59,7 +59,7 @@ func (p *partition) pushReady(ctx context.Context, msgID string, msg *omq.Messag
 		msgID, enc, msg.MaxRetry, ttl).Err()
 }
 
-func (p *partition) delayToReady(ctx context.Context, delayAt int64, num int) (int, error) {
+func (p *partition) delayToReady(ctx context.Context, delayAt, num int64) (int, error) {
 	return _delayToReadyCmd.Run(ctx, p.rds, []string{p.delay, p.ready}, delayAt, num).Int()
 }
 
