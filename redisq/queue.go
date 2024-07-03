@@ -151,7 +151,7 @@ func (q *queue) Produce(ctx context.Context, msg *omq.Message) error {
 		}
 	}
 
-	if msg.MaxRetry <= 0 {
+	if msg.MaxRetry < 0 {
 		msg.MaxRetry = q.maxRetry
 	}
 
@@ -308,12 +308,6 @@ func (q *queue) fetchMessage(ctx context.Context, ch chan<- *omq.Message) {
 			}
 		}
 
-		select {
-		case <-ctx.Done():
-			close(ch)
-			return
-		default:
-		}
 	}
 
 }
