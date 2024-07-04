@@ -72,7 +72,7 @@ func commitTimeoutToReady(ctx context.Context, p partition, timeoutAt, num int64
 }
 
 func commitTimeoutToDelay(ctx context.Context, p partition, timeoutAt, num int64) (int, error) {
-	retryAt := time.Now().Unix() + 2
+	retryAt := time.Now().Unix()
 	return _unCommitToDelayCmd.Run(ctx, p.rds, []string{p.unCommit, p.delay}, timeoutAt, num, p.prefix, retryAt).Int()
 }
 
@@ -81,7 +81,7 @@ func uniqueCommitTimeoutToReady(ctx context.Context, p partition, timeoutAt, num
 }
 
 func uniqueCommitTimeoutToDelay(ctx context.Context, p partition, timeoutAt, num int64) (int, error) {
-	retryAt := time.Now().Unix() + 2
+	retryAt := time.Now().Unix()
 	return _uniqueUnCommitToDelayCmd.Run(ctx, p.rds, []string{p.unCommit, p.delay}, timeoutAt, num, retryAt).Int()
 }
 

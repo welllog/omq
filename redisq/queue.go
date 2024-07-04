@@ -15,7 +15,6 @@ import (
 
 type queue struct {
 	rds                       redis.UniversalClient
-	keyPrefix                 string
 	disableDelay              bool
 	disableReady              bool
 	delMsgOnCommit            bool
@@ -99,7 +98,6 @@ func NewQueue(rds redis.UniversalClient, keyPrefix string, opts ...Option) omq.Q
 
 	q := &queue{
 		rds:                       rds,
-		keyPrefix:                 keyPrefix,
 		disableDelay:              o.disableDelay,
 		disableReady:              o.disableReady,
 		delMsgOnCommit:            o.delMsgOnCommit,
@@ -218,6 +216,7 @@ func (q *queue) mutexLoop(ctx context.Context) {
 			if lockInterval == 0 {
 				locked = q.tryLock(ctx, lockTtl*time.Second)
 			}
+			lockInterval++
 
 			if locked {
 				if !q.disableReady && !q.disableDelay {
@@ -225,11 +224,14 @@ func (q *queue) mutexLoop(ctx context.Context) {
 				}
 
 				q.commitTimeoutTask(ctx, unix, batchSize)
-			}
 
-			lockInterval++
-			if lockInterval >= lockTtl { // maybe no server get lock on period of lockTtl
-				lockInterval = 0
+				if lockInterval > lockTtl { // maybe no server get lock on period of lockTtl
+					lockInterval = 0
+				}
+			} else {
+				if lockInterval >= lockTtl/2 {
+					lockInterval = 0
+				}
 			}
 
 			now = <-ticker.C
