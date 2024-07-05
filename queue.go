@@ -6,10 +6,12 @@ import (
 )
 
 type Message struct {
-	ID       string
-	Topic    string
-	Payload  Encoder
-	DelayAt  time.Time
+	ID      string
+	Topic   string
+	Payload Encoder
+	DelayAt time.Time
+	// MaxRetry is the max retry times, if it is 0, it means no retry
+	// if it is -1, it use the default max retry times
 	MaxRetry int
 	Metadata any
 }

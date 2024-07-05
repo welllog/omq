@@ -13,10 +13,15 @@ var (
 )
 
 func encodeMsg(msg *omq.Message) (string, error) {
-	payload, err := msg.Payload.Encode()
-	if err != nil {
-		return "", err
+	var payload []byte
+	if msg.Payload != nil {
+		b, err := msg.Payload.Encode()
+		if err != nil {
+			return "", err
+		}
+		payload = b
 	}
+
 	size := 4 + len(msg.ID) + len(msg.Topic) + len(payload)
 	arr := []string{
 		"1", msg.ID, msg.Topic,
