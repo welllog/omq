@@ -2,6 +2,7 @@ package redisq
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 	"time"
 
@@ -57,4 +58,19 @@ func TestEncodeDecode(t *testing.T) {
 			t.Fatalf("decodeMsg(%s).Payload = %s, want %s", enc, msg.Payload, tests[i].Payload)
 		}
 	}
+}
+
+func TestEncodeNil(t *testing.T) {
+	var msg omq.Message
+	s, err := encodeMsg(&msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println(s)
+
+	err = decodeMsg(s, &msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println(msg.Payload.(omq.ByteEncoder))
 }

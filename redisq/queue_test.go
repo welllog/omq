@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,7 +22,7 @@ func TestMain(m *testing.M) {
 }
 
 func TestQueue_Produce(t *testing.T) {
-	ttlOpt := WithMsgTTL(1800)
+	ttlOpt := WithMsgTTL(60)
 	delOpt := WithDelMsgOnCommit()
 	timeoutOpt := WithCommitTimeout(1)
 
@@ -56,104 +57,6 @@ func TestQueue_Produce(t *testing.T) {
 	testQueueCommitTimeOut(t, q6)
 }
 
-func TestQueueProduce(t *testing.T) {
-	q := NewQueue(_rds, "test:queue", WithPartitionNum(2), WithDelMsgOnCommit(), WithMsgTTL(20), WithMaxRetry(0))
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	now := time.Now()
-	msgs := []*omq.Message{
-		{
-			Topic:    "ready1",
-			Payload:  omq.ByteEncoder("words1"),
-			MaxRetry: 1,
-		},
-		{
-			Topic:    "ready2",
-			Payload:  omq.ByteEncoder("words2"),
-			MaxRetry: 1,
-		},
-		{
-			Topic:   "ready3",
-			Payload: omq.ByteEncoder("words3"),
-		},
-		{
-			Topic:   "delay1",
-			Payload: omq.ByteEncoder("words4"),
-			DelayAt: now.Add(time.Second),
-		},
-		{
-			Topic:   "delay2",
-			Payload: omq.ByteEncoder("words5"),
-			DelayAt: now.Add(time.Second),
-		},
-		{
-			Topic:   "delay3",
-			Payload: omq.ByteEncoder("words6"),
-			DelayAt: now.Add(time.Second),
-		},
-	}
-
-	for _, msg := range msgs {
-		q.Produce(ctx, msg)
-	}
-
-	fetcher, err := q.Fetcher(ctx, 2)
-	if err != nil {
-		t.Fatalf("\t%s fetcher get: %v", failed, err)
-	}
-
-	go func() {
-		time.Sleep(1500 * time.Millisecond)
-		cancel()
-	}()
-
-	for msg := range fetcher.Messages() {
-		fetcher.Commit(ctx, msg)
-		fmt.Println(msg)
-	}
-
-	q.Clear(context.TODO())
-}
-
-func TestQueueCommitTimeOut(t *testing.T) {
-	q := NewQueue(_rds, "test:queue", WithPartitionNum(2), WithDelMsgOnCommit(),
-		WithMsgTTL(10), WithCommitTimeout(1))
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	q.Produce(ctx, &omq.Message{
-		Topic:    "ready1",
-		Payload:  omq.ByteEncoder("words1"),
-		MaxRetry: 3,
-	})
-
-	now := time.Now()
-	fetcher, err := q.Fetcher(ctx, 2)
-	if err != nil {
-		t.Fatalf("\t%s fetcher get: %v", failed, err)
-	}
-
-	go func() {
-		time.Sleep(10 * time.Second)
-		cancel()
-	}()
-
-	var i int
-	for msg := range fetcher.Messages() {
-		now1 := time.Now()
-		fmt.Println(now1.Sub(now).Milliseconds())
-		now = now1
-		fmt.Printf("%+v \n", msg)
-		if i > 5 {
-			fetcher.Commit(ctx, msg)
-		}
-		i++
-	}
-
-	q.Clear(context.TODO())
-}
-
 func TestWithPartitionOrder(t *testing.T) {
 	q := NewQueue(_rds, "test:queue", WithPartitionNum(3), WithDelMsgOnCommit(),
 		WithMsgTTL(10), WithCommitTimeout(1), WithPartitionOrder())
@@ -164,9 +67,9 @@ func TestWithPartitionOrder(t *testing.T) {
 		{Topic: "t1", Payload: omq.ByteEncoder("words1")},
 		{Topic: "t1", Payload: omq.ByteEncoder("words2")},
 		{Topic: "t1", Payload: omq.ByteEncoder("words3")},
-		{ID: "12345", Topic: "t2", Payload: omq.ByteEncoder("words4")},
-		{ID: "12345", Topic: "t2", Payload: omq.ByteEncoder("words5")},
-		{ID: "12345", Topic: "t2", Payload: omq.ByteEncoder("words6")},
+		{ID: "123", Topic: "t2", Payload: omq.ByteEncoder("words4")},
+		{ID: "123", Topic: "t2", Payload: omq.ByteEncoder("words5")},
+		{ID: "123", Topic: "t2", Payload: omq.ByteEncoder("words6")},
 	}
 	for _, tt := range tests {
 		if err := q.Produce(ctx, tt); err != nil {
@@ -290,7 +193,7 @@ func TestWithSleepOnEmpty(t *testing.T) {
 			}
 			i++
 		}
-		//t.Log(meta.partition, "---", msg.ID, "---", msg.Topic, time.Since(now).Seconds())
+		// t.Log(meta.partition, "---", msg.ID, "---", msg.Topic, time.Since(now).Seconds())
 	}
 
 	q.Clear(context.Background())
@@ -408,7 +311,7 @@ func testQueue(t *testing.T, q omq.Queue, unique bool) {
 
 	fmt.Printf("period: %f s \n", period.Seconds())
 	fmt.Printf("all cost %f s\n", time.Since(begin).Seconds())
-	fmt.Printf("--------------%s %s complete----------------------\n", rq.partitions[0].prefix, "testQueue")
+	fmt.Printf("------------------------------------\n")
 }
 
 func testDelayQueue(t *testing.T, q omq.Queue, unique bool) {
@@ -521,7 +424,7 @@ func testDelayQueue(t *testing.T, q omq.Queue, unique bool) {
 
 	fmt.Printf("period: %f s \n", period.Seconds())
 	fmt.Printf("all cost %f s\n", time.Since(begin).Seconds())
-	fmt.Printf("--------------%s %s complete----------------------\n", rq.partitions[0].prefix, "testDelayQueue")
+	fmt.Printf("------------------------------------\n")
 }
 
 func testReadyQueue(t *testing.T, q omq.Queue, unique bool) {
@@ -639,7 +542,7 @@ func testReadyQueue(t *testing.T, q omq.Queue, unique bool) {
 
 	fmt.Printf("period: %f s \n", period.Seconds())
 	fmt.Printf("all cost %f s\n", time.Since(begin).Seconds())
-	fmt.Printf("--------------%s %s complete----------------------\n", rq.partitions[0].prefix, "testReadyQueue")
+	fmt.Println("------------------------------------")
 }
 
 func testQueueCommitTimeOut(t *testing.T, q omq.Queue) {
@@ -656,7 +559,7 @@ func testQueueCommitTimeOut(t *testing.T, q omq.Queue) {
 	rNil(t, err)
 
 	go func() {
-		time.Sleep(10 * time.Second)
+		time.Sleep(11 * time.Second)
 		cancel()
 	}()
 
@@ -743,4 +646,66 @@ func rBytes(t *testing.T, got []byte, want string) {
 		t.Helper()
 		t.Fatalf("got: %s, want: %s", got, want)
 	}
+}
+
+func TestQueueLock(t *testing.T) {
+	var w sync.WaitGroup
+	w.Add(2)
+
+	go lockLoop(&w, 1)
+	go lockLoop(&w, 2)
+
+	w.Wait()
+}
+
+func lockLoop(w *sync.WaitGroup, id int) {
+	var (
+		locked       bool
+		lockInterval time.Duration
+		lockTtl      = time.Duration(6)
+		lockTime     time.Time
+	)
+
+	ctx := context.Background()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	var n int
+	for {
+		if lockInterval == 0 {
+			locked = _rds.SetNX(ctx, "lock", "1", lockTtl*time.Second).Val()
+			if locked {
+				now := time.Now()
+				if !lockTime.IsZero() {
+					fmt.Printf("locked interval %f s; id: %d\n", now.Sub(lockTime).Seconds(), id)
+				} else {
+					fmt.Printf("locked id: %d\n", id)
+				}
+				lockTime = now
+			}
+		}
+
+		lockInterval++
+		if locked {
+			time.Sleep(10 * time.Millisecond)
+
+			if lockInterval > lockTtl { // maybe no server get lock on period of lockTtl
+				lockInterval = 0
+			}
+		} else {
+			if lockInterval >= 3 {
+				lockInterval = 0
+			}
+		}
+
+		n++
+		if n == 60 {
+			break
+		}
+
+		<-ticker.C
+
+	}
+
+	w.Done()
 }

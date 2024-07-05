@@ -229,7 +229,7 @@ func (q *queue) mutexLoop(ctx context.Context) {
 					lockInterval = 0
 				}
 			} else {
-				if lockInterval >= lockTtl/2 {
+				if lockInterval >= 3 {
 					lockInterval = 0
 				}
 			}
